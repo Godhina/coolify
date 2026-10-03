@@ -2,6 +2,7 @@
 
 namespace App\Livewire\Project\Application;
 
+use App\Enums\HttpBasicAuthHashAlgorithm;
 use App\Enums\StaticImageTypes;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Livewire\Project\Service\Storage;
@@ -116,6 +117,14 @@ class General extends Component
 
     public ?string $httpBasicAuthPassword = null;
 
+    public string $httpBasicAuthHashAlgorithm = HttpBasicAuthHashAlgorithm::BCRYPT->value;
+
+    public int $httpBasicAuthBcryptCost = 10;
+
+    public int $httpBasicAuthArgon2idMemoryCost = 65536;
+
+    public int $httpBasicAuthArgon2idTimeCost = 4;
+
     public ?string $watchPaths = null;
 
     public string $redirect;
@@ -191,7 +200,11 @@ class General extends Component
             'isPreserveRepositoryEnabled' => 'boolean|required',
             'isHttpBasicAuthEnabled' => 'boolean|required',
             'httpBasicAuthUsername' => 'string|nullable',
-            'httpBasicAuthPassword' => 'string|nullable',
+            'httpBasicAuthPassword' => 'string|nullable|max:72',
+            'httpBasicAuthHashAlgorithm' => ['required', Rule::enum(HttpBasicAuthHashAlgorithm::class)],
+            'httpBasicAuthBcryptCost' => 'required|integer|min:4|max:15',
+            'httpBasicAuthArgon2idMemoryCost' => 'required|integer|min:8192|max:524288',
+            'httpBasicAuthArgon2idTimeCost' => 'required|integer|min:1|max:16',
             'watchPaths' => 'nullable',
             'redirect' => 'string|required',
         ];
@@ -365,6 +378,9 @@ class General extends Component
         if ($toModel) {
             $this->validate();
             $this->validateChangedDockerComposeRaw();
+            if ($this->httpBasicAuthHashAlgorithm === HttpBasicAuthHashAlgorithm::ARGON2ID->value && ! $this->application->destination->server->caddySupportsArgon2idBasicAuth()) {
+                throw new Exception('Argon2id needs a server that runs the Caddy proxy, version 2.11 or newer.');
+            }
 
             // Application properties
             $this->application->name = $this->name;
@@ -405,6 +421,10 @@ class General extends Component
             $this->application->is_http_basic_auth_enabled = $this->isHttpBasicAuthEnabled;
             $this->application->http_basic_auth_username = $this->httpBasicAuthUsername;
             $this->application->http_basic_auth_password = $this->httpBasicAuthPassword;
+            $this->application->http_basic_auth_hash_algorithm = $this->httpBasicAuthHashAlgorithm;
+            $this->application->http_basic_auth_bcrypt_cost = $this->httpBasicAuthBcryptCost;
+            $this->application->http_basic_auth_argon2id_memory_cost = $this->httpBasicAuthArgon2idMemoryCost;
+            $this->application->http_basic_auth_argon2id_time_cost = $this->httpBasicAuthArgon2idTimeCost;
             $this->application->watch_paths = $this->watchPaths;
             $this->application->redirect = $this->redirect;
 
@@ -458,6 +478,10 @@ class General extends Component
             $this->httpBasicAuthPassword = auth()->user()->can('update', $this->application)
                 ? $this->application->http_basic_auth_password
                 : null;
+            $this->httpBasicAuthHashAlgorithm = ($this->application->usesArgon2idBasicAuth() ? HttpBasicAuthHashAlgorithm::ARGON2ID : HttpBasicAuthHashAlgorithm::BCRYPT)->value;
+            $this->httpBasicAuthBcryptCost = $this->application->http_basic_auth_bcrypt_cost ?? 10;
+            $this->httpBasicAuthArgon2idMemoryCost = $this->application->http_basic_auth_argon2id_memory_cost ?? 65536;
+            $this->httpBasicAuthArgon2idTimeCost = $this->application->http_basic_auth_argon2id_time_cost ?? 4;
             $this->watchPaths = $this->application->watch_paths;
             $this->redirect = $this->application->redirect;
 
@@ -495,7 +519,7 @@ class General extends Component
             if ($oldIsSpa !== $this->isSpa) {
                 $this->generateNginxConfiguration($this->isSpa ? 'spa' : 'static');
             }
-            if ($oldIsHttpBasicAuthEnabled !== $this->isHttpBasicAuthEnabled) {
+            if ($oldIsHttpBasicAuthEnabled !== $this->isHttpBasicAuthEnabled || $this->application->isDirty(['http_basic_auth_hash_algorithm', 'http_basic_auth_bcrypt_cost', 'http_basic_auth_argon2id_memory_cost', 'http_basic_auth_argon2id_time_cost'])) {
                 $this->application->save();
             }
 
