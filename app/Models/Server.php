@@ -1225,6 +1225,12 @@ $siteAddress {
         return $this->caddyRunsCurrentVersion();
     }
 
+    public function caddySupportsArgon2idBasicAuth(): bool
+    {
+        return $this->caddyRunsCurrentVersion()
+            && self::caddyDockerProxyImageVersion($this->configuredCaddyProxyImage()) >= [2, 11];
+    }
+
     public function isServerApiEnabled(): bool
     {
         return $this->settings->is_sentinel_enabled;
