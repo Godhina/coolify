@@ -2,10 +2,14 @@
 
 use App\Livewire\Settings\Updates;
 use App\Models\InstanceSettings;
+use App\Models\ScheduledDatabaseBackup;
 use App\Models\Server;
+use App\Models\StandaloneDocker;
+use App\Models\StandalonePostgresql;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Once;
 use Livewire\Livewire;
 
@@ -60,3 +64,88 @@ test('instance admin cannot save an invalid docker registry url', function () {
 
     expect($settings->fresh()->docker_registry_url)->toBe('docker.io');
 });
+
+test('instance admin can turn the backup before update off', function () {
+    config()->set('constants.coolify.self_hosted', false);
+
+    $rootTeam = Team::find(0) ?? Team::factory()->create(['id' => 0]);
+    $settings = InstanceSettings::forceCreate(['id' => 0]);
+    Once::flush();
+
+    $user = User::factory()->create();
+    $rootTeam->members()->attach($user->id, ['role' => 'admin']);
+
+    $this->actingAs($user);
+    session(['currentTeam' => ['id' => $rootTeam->id]]);
+
+    Livewire::test(Updates::class)
+        ->assertSet('is_backup_before_update_enabled', true)
+        ->set('is_backup_before_update_enabled', false)
+        ->call('instantSave')
+        ->assertDispatched('success');
+
+    expect($settings->fresh()->is_backup_before_update_enabled)->toBeFalse();
+});
+
+test('a team member cannot turn the backup before update off', function () {
+    Process::fake();
+    $rootTeam = Team::find(0) ?? Team::factory()->create(['id' => 0]);
+    $settings = InstanceSettings::forceCreate(['id' => 0]);
+    Once::flush();
+
+    $team = Team::factory()->create();
+    $user = User::factory()->create();
+    $team->members()->attach($user->id, ['role' => 'member']);
+
+    $this->actingAs($user);
+    session(['currentTeam' => ['id' => $team->id]]);
+
+    try {
+        Livewire::test(Updates::class)
+            ->set('is_backup_before_update_enabled', false)
+            ->call('instantSave');
+    } catch (Throwable) {
+        // The page never loads its settings for this user, so the action cannot run.
+    }
+
+    expect($settings->fresh()->is_backup_before_update_enabled)->toBeTrue();
+});
+
+test('the updates page warns when backup before update has no instance backup to run', function (bool $hasInstanceBackup) {
+    $rootTeam = Team::find(0) ?? Team::factory()->create(['id' => 0]);
+    Server::factory()->create(['id' => 0, 'team_id' => $rootTeam->id]);
+    InstanceSettings::forceCreate(['id' => 0]);
+    Once::flush();
+    if ($hasInstanceBackup) {
+        (new StandalonePostgresql)->forceFill([
+            'id' => 0,
+            'name' => 'coolify-db',
+            'postgres_user' => 'coolify',
+            'postgres_password' => 'password',
+            'postgres_db' => 'coolify',
+            'destination_type' => StandaloneDocker::class,
+            'destination_id' => 0,
+        ])->save();
+        ScheduledDatabaseBackup::create([
+            'frequency' => '0 0 * * *',
+            'database_id' => 0,
+            'database_type' => StandalonePostgresql::class,
+            'team_id' => 0,
+        ]);
+    }
+
+    $user = User::factory()->create();
+    $rootTeam->members()->attach($user->id, ['role' => 'admin']);
+
+    $this->actingAs($user);
+    session(['currentTeam' => ['id' => $rootTeam->id]]);
+
+    $component = Livewire::test(Updates::class)->assertSee('Backup before update');
+
+    $hasInstanceBackup
+        ? $component->assertDontSee('No instance backup is configured')
+        : $component->assertSee('No instance backup is configured');
+})->with([
+    'no instance backup' => [false],
+    'instance backup configured' => [true],
+]);

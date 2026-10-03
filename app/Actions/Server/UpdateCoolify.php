@@ -2,7 +2,10 @@
 
 namespace App\Actions\Server;
 
+use App\Jobs\DatabaseBackupJob;
+use App\Models\InstanceSettings;
 use App\Models\Server;
+use App\Models\StandalonePostgresql;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Sleep;
@@ -109,9 +112,50 @@ class UpdateCoolify
             );
         }
 
+        $this->backupDatabaseBeforeUpdate($settings);
         $this->update();
         $settings->new_version_available = false;
         $settings->save();
+    }
+
+    /**
+     * Runs the instance backup from Settings > Backup. The update is not started when it fails.
+     */
+    private function backupDatabaseBeforeUpdate(InstanceSettings $settings): void
+    {
+        $backup = StandalonePostgresql::find(0)?->scheduledBackups()->first();
+        if (! $settings->is_backup_before_update_enabled || ! $backup) {
+            return;
+        }
+
+        $this->writeUpgradeStatus('1', 'Backing up the Coolify database');
+        $lastExecutionId = (int) $backup->executions()->max('id');
+
+        try {
+            DatabaseBackupJob::dispatchSync($backup);
+            // No new execution means that this backup is already running.
+            $failed = $backup->executions()->where('id', '>', $lastExecutionId)->where('status', '!=', 'success')->exists();
+        } catch (\Throwable $e) {
+            Log::error('The database backup before the Coolify update failed.', ['error' => $e->getMessage()]);
+            $failed = true;
+        }
+
+        if ($failed) {
+            $message = 'The database backup failed, so the update was not started. Check the backup in Settings > Backup.';
+            $this->writeUpgradeStatus('error', $message);
+
+            throw new \RuntimeException($message);
+        }
+    }
+
+    /**
+     * Writes the line format of upgrade.sh. Uses tee so a non-root SSH user writes the file through sudo.
+     */
+    private function writeUpgradeStatus(string $step, string $message): void
+    {
+        $status = escapeshellarg("{$step}|{$message}|".now()->toIso8601String());
+
+        instant_remote_process(["printf '%s\\n' {$status} | tee /data/coolify/source/.upgrade-status > /dev/null"], $this->server, false);
     }
 
     private function update()

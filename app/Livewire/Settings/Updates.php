@@ -5,6 +5,7 @@ namespace App\Livewire\Settings;
 use App\Jobs\CheckForUpdatesJob;
 use App\Models\InstanceSettings;
 use App\Models\Server;
+use App\Models\StandalonePostgresql;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
@@ -28,6 +29,9 @@ class Updates extends Component
     #[Validate('boolean')]
     public bool $is_auto_update_enabled;
 
+    #[Validate('boolean')]
+    public bool $is_backup_before_update_enabled = true;
+
     #[Validate('required|string|in:docker.io,ghcr.io')]
     public string $docker_registry_url;
 
@@ -44,6 +48,7 @@ class Updates extends Component
         $this->auto_update_frequency = $this->settings->auto_update_frequency;
         $this->update_check_frequency = $this->settings->update_check_frequency;
         $this->is_auto_update_enabled = $this->settings->is_auto_update_enabled;
+        $this->is_backup_before_update_enabled = $this->settings->is_backup_before_update_enabled;
         $this->docker_registry_url = $this->settings->docker_registry_url ?: 'docker.io';
     }
 
@@ -62,6 +67,7 @@ class Updates extends Component
             $this->settings->auto_update_frequency = $this->auto_update_frequency;
             $this->settings->update_check_frequency = $this->update_check_frequency;
             $this->settings->is_auto_update_enabled = $this->is_auto_update_enabled;
+            $this->settings->is_backup_before_update_enabled = $this->is_backup_before_update_enabled;
             $this->settings->docker_registry_url = $validated['docker_registry_url'];
             $this->syncRegistryUrlToEnv($validated['docker_registry_url']);
             $this->settings->save();
@@ -162,6 +168,8 @@ class Updates extends Component
 
     public function render()
     {
-        return view('livewire.settings.updates');
+        return view('livewire.settings.updates', [
+            'hasInstanceBackup' => (bool) StandalonePostgresql::find(0)?->scheduledBackups()->exists(),
+        ]);
     }
 }

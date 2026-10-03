@@ -1,9 +1,14 @@
 <?php
 
 use App\Actions\Server\UpdateCoolify;
+use App\Jobs\DatabaseBackupJob;
 use App\Livewire\Settings\Updates;
 use App\Models\InstanceSettings;
+use App\Models\PrivateKey;
+use App\Models\ScheduledDatabaseBackup;
 use App\Models\Server;
+use App\Models\StandaloneDocker;
+use App\Models\StandalonePostgresql;
 use App\Models\Team;
 use App\Models\User;
 use App\Support\RemoteProcessCommand;
@@ -11,6 +16,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Once;
@@ -38,6 +44,65 @@ function updateCoolifyTestCreateRootServerAndSettings(array $settings = []): voi
         'update_check_frequency' => '0 * * * *',
     ], $settings));
     Once::flush();
+}
+
+function updateCoolifyTestCreateInstanceBackup(string $serverUser = 'root'): ScheduledDatabaseBackup
+{
+    Server::findOrFail(0)->update([
+        'user' => $serverUser,
+        'private_key_id' => PrivateKey::factory()->create(['team_id' => 0])->id,
+    ]);
+    Server::flushIdentityMap();
+    (new StandalonePostgresql)->forceFill([
+        'id' => 0,
+        'name' => 'coolify-db',
+        'postgres_user' => 'coolify',
+        'postgres_password' => 'password',
+        'postgres_db' => 'coolify',
+        'status' => 'running',
+        'destination_type' => StandaloneDocker::class,
+        'destination_id' => 0,
+    ])->save();
+
+    return ScheduledDatabaseBackup::create([
+        'enabled' => true,
+        'save_s3' => false,
+        'frequency' => '0 0 * * *',
+        'database_id' => 0,
+        'database_type' => StandalonePostgresql::class,
+        'team_id' => 0,
+    ]);
+}
+
+function updateCoolifyTestFakeBackupCommands(bool $dumpSucceeds): void
+{
+    Process::fake(function ($process) use ($dumpSucceeds) {
+        $command = is_array($process->command) ? implode(' ', $process->command) : $process->command;
+
+        return match (true) {
+            str_contains($command, 'pg_dump') && ! $dumpSucceeds => Process::result(errorOutput: 'pg_dump: error: No space left on device', exitCode: 1),
+            str_contains($command, 'du -b') => Process::result(output: $dumpSucceeds ? '2048' : '0'),
+            default => Process::result(),
+        };
+    });
+}
+
+function updateCoolifyTestUpdateIsAvailable(): void
+{
+    Notification::fake();
+    config([
+        'app.env' => 'testing',
+        'constants.coolify.version' => '4.0.9',
+        'constants.coolify.helper_version' => '1.0.14',
+        'constants.coolify.upgrade_script_url' => 'https://cdn.example.com/upgrade.sh',
+        'constants.ssh.mux_enabled' => false,
+    ]);
+    Http::fake(['*' => Http::response(['coolify' => ['v4' => ['version' => '4.0.10']]], 200)]);
+}
+
+function updateCoolifyTestRanUpgradeScript($process): bool
+{
+    return str_contains($process->command, "bash /data/coolify/source/upgrade.sh '4.0.10'");
 }
 
 afterEach(function () {
@@ -315,4 +380,62 @@ it('prevents downgrade even with manual update', function () {
         expect($e->getMessage())->toContain('4.0.10');
         expect($e->getMessage())->toContain('4.0.0');
     }
+});
+
+it('backs up the instance database before it starts the update', function () {
+    updateCoolifyTestUpdateIsAvailable();
+    updateCoolifyTestCreateRootServerAndSettings();
+    $backup = updateCoolifyTestCreateInstanceBackup();
+    updateCoolifyTestFakeBackupCommands(dumpSucceeds: true);
+
+    (new UpdateCoolify)->handle(manual_update: true);
+
+    expect($backup->executions()->pluck('status')->all())->toBe(['success']);
+    Process::assertRan(fn ($process) => str_contains($process->command, "'1|Backing up the Coolify database|"));
+    Process::assertRan(updateCoolifyTestRanUpgradeScript(...));
+});
+
+it('does not start the update when the database backup fails', function (string $serverUser, string $printf, string $tee) {
+    updateCoolifyTestUpdateIsAvailable();
+    updateCoolifyTestCreateRootServerAndSettings(['new_version_available' => true]);
+    $backup = updateCoolifyTestCreateInstanceBackup($serverUser);
+    updateCoolifyTestFakeBackupCommands(dumpSucceeds: false);
+
+    expect(fn () => (new UpdateCoolify)->handle(manual_update: true))
+        ->toThrow(RuntimeException::class, 'The database backup failed, so the update was not started.');
+
+    expect($backup->executions()->pluck('status')->all())->toBe(['failed'])
+        ->and((bool) InstanceSettings::findOrFail(0)->new_version_available)->toBeTrue();
+    Process::assertDidntRun(updateCoolifyTestRanUpgradeScript(...));
+    Process::assertRan(fn ($process) => str_contains($process->command, "\n{$printf} 'error|The database backup failed, so the update was not started.")
+        && str_contains($process->command, "{$tee} /data/coolify/source/.upgrade-status > /dev/null\n"));
+})->with([
+    'root' => ['root', "printf '%s\\n'", '| tee'],
+    'non-root' => ['cooluser', "sudo printf '%s\\n'", '| sudo tee'],
+]);
+
+it('starts the update without a backup when backup before update is disabled', function () {
+    updateCoolifyTestUpdateIsAvailable();
+    updateCoolifyTestCreateRootServerAndSettings(['is_backup_before_update_enabled' => false]);
+    $backup = updateCoolifyTestCreateInstanceBackup();
+    updateCoolifyTestFakeBackupCommands(dumpSucceeds: false);
+
+    (new UpdateCoolify)->handle(manual_update: true);
+
+    expect($backup->executions()->count())->toBe(0);
+    Process::assertRan(updateCoolifyTestRanUpgradeScript(...));
+});
+
+it('starts the update when the instance backup is already running', function () {
+    updateCoolifyTestUpdateIsAvailable();
+    updateCoolifyTestCreateRootServerAndSettings();
+    $backup = updateCoolifyTestCreateInstanceBackup();
+    updateCoolifyTestFakeBackupCommands(dumpSucceeds: true);
+    // The lock a running DatabaseBackupJob of this backup holds.
+    Cache::lock('laravel-queue-overlap:'.DatabaseBackupJob::class.':database-backup-'.$backup->id, 60)->get();
+
+    (new UpdateCoolify)->handle(manual_update: true);
+
+    expect($backup->executions()->count())->toBe(0);
+    Process::assertRan(updateCoolifyTestRanUpgradeScript(...));
 });

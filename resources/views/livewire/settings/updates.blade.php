@@ -51,6 +51,24 @@
                 </div>
             </x-application.settings-section>
 
+            <x-application.settings-section title="Backup before update"
+                helper="Back up the Coolify database before an update is installed, from this page or automatically. If the backup fails, the update is not installed.">
+                <div class="max-w-md">
+                    <x-forms.listbox id="is_backup_before_update_enabled" label="Database backup"
+                        onChange="instantSave" :options="[
+                            ['value' => true, 'label' => 'Enabled'],
+                            ['value' => false, 'label' => 'Disabled'],
+                        ]"
+                        helper="Runs the instance backup from Settings > Backup, with its storage and retention." />
+                </div>
+                @if ($is_backup_before_update_enabled && ! $hasInstanceBackup)
+                    <x-callout type="warning" title="No instance backup is configured" class="mt-4">
+                        Updates are installed without a backup until you
+                        <a class="underline" href="{{ route('settings.backup') }}" {{ wireNavigate() }}>configure the instance backup</a>.
+                    </x-callout>
+                @endif
+            </x-application.settings-section>
+
             <x-application.settings-section title="Image registry">
                 <div class="max-w-md">
                     <x-forms.listbox id="docker_registry_url" label="Docker registry" :options="[
