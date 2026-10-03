@@ -51,6 +51,7 @@ return [
 
     'migration' => [
         'is_migration_enabled' => env('MIGRATION_ENABLED', true),
+        'failed_marker' => storage_path('framework/migration-failed'),
     ],
 
     'seeder' => [
